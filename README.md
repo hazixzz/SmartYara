@@ -35,10 +35,10 @@
 
 ## Step 2 — Backend Setup
 
-Open PowerShell in the backend folder:
+Open PowerShell in the repository root and go to the backend folder:
 
 ```powershell
-cd C:\Users\ctcom\Downloads\fyp1\smartyara_prototype\backend
+cd backend
 ```
 
 Install the Python dependencies:
@@ -53,9 +53,13 @@ Create the environment file:
 Copy-Item .\.env.example .\.env
 ```
 
-Open `backend\.env` and add your API keys:
+Open `backend\.env` and fill in:
 - `GEMINI_API_KEY`
 - `GCP_NLP_API_KEY`
+- `SECRET_KEY` (any long random string)
+- `ADMIN_PASSWORD` (optional, creates an `admin` account on first start)
+
+`.env` is git-ignored, so never commit it.
 
 Run the backend server:
 
@@ -69,7 +73,7 @@ The API will be live at:
 - http://127.0.0.1:8000
 - http://127.0.0.1:8000/docs
 
-**Default login:** `admin` / `admin123`
+**Login:** there is no default account. Either set `ADMIN_PASSWORD` in `.env` before the first start, or register a user via `POST /auth/register` (see `/docs`).
 
 ---
 
@@ -78,7 +82,7 @@ The API will be live at:
 Open a second terminal and go to the frontend folder:
 
 ```powershell
-cd C:\Users\ctcom\Downloads\fyp1\smartyara_prototype\frontend
+cd frontend
 ```
 
 Get Flutter packages:
@@ -105,7 +109,7 @@ If `flutter` is not recognized, make sure the Flutter SDK is installed and the `
 
 ## Demo Flow (for presentation)
 
-1. Open the app and login with **admin / admin123**
+1. Open the app and log in with the admin account from your `.env`
 2. Dashboard shows stats (0 artifacts to start)
 3. Click **Upload Artifact**
 4. Upload a `.txt` file containing malware-like indicators

@@ -4,7 +4,10 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional
-import sqlite3, os, hashlib, jwt, shutil, httpx, json, re
+from dotenv import load_dotenv
+import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt
+
+load_dotenv()
 
 app = FastAPI(title="SmartYARA API")
 
@@ -73,19 +76,28 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
     """)
-    # Seed a default admin user  (password: admin123)
-    pw = hash_password("admin123")
-    try:
-        conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                     ("admin", pw, "admin"))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    # Seed an admin user only if ADMIN_PASSWORD is set in the environment
+    admin_pw = os.getenv("ADMIN_PASSWORD")
+    if admin_pw:
+        try:
+            conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                         (os.getenv("ADMIN_USERNAME", "admin"), hash_password(admin_pw), "admin"))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
     conn.close()
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
+MAX_PASSWORD_BYTES = 72   # bcrypt limit
+
 def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except ValueError:   # >72 bytes or non-bcrypt hash
+        return False
 
 def create_token(data: dict) -> str:
     payload = data.copy()
@@ -113,6 +125,9 @@ class RegisterRequest(BaseModel):
 
 @app.post("/auth/register")
 def register(req: RegisterRequest):
+    if len(req.password.encode()) > MAX_PASSWORD_BYTES:
+        raise HTTPException(status_code=400,
+                            detail=f"Password must be at most {MAX_PASSWORD_BYTES} bytes")
     conn = get_db()
     try:
         conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
@@ -128,11 +143,10 @@ def register(req: RegisterRequest):
 def login(form: OAuth2PasswordRequestForm = Depends()):
     conn = get_db()
     user = conn.execute(
-        "SELECT * FROM users WHERE username=? AND password=?",
-        (form.username, hash_password(form.password))
+        "SELECT * FROM users WHERE username=?", (form.username,)
     ).fetchone()
     conn.close()
-    if not user:
+    if not user or not verify_password(form.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token({"sub": user["username"], "role": user["role"], "id": user["id"]})
     return {"access_token": token, "token_type": "bearer",
@@ -228,9 +242,11 @@ Requirements:
 5. Output ONLY the raw YARA rule — no explanation, no markdown fences.
 """
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}")
+           f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}")
+    # thinkingBudget=0: otherwise 2.5's thinking tokens eat into maxOutputTokens
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024}}
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024,
+                                 "thinkingConfig": {"thinkingBudget": 0}}}
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, json=body)
     if r.status_code != 200:
@@ -247,7 +263,7 @@ def _fallback_yara(filename: str, indicators: list[dict]) -> str:
     rule_name = re.sub(r'\W+', '_', filename.rsplit('.', 1)[0]) or "unknown_malware"
     strings_section = ""
     for i, ind in enumerate(indicators[:10]):
-        safe = ind["value"].replace('"', '\\"').replace('\\', '\\\\')
+        safe = ind["value"].replace('\\', '\\\\').replace('"', '\\"')
         strings_section += f'        $s{i} = "{safe}"\n'
     if not strings_section:
         strings_section = '        $s0 = "malware"\n'
@@ -348,12 +364,13 @@ def list_artifacts(user=Depends(get_current_user)):
 def get_rule(artifact_id: int, user=Depends(get_current_user)):
     conn = get_db()
     rule = conn.execute(
-        "SELECT * FROM yara_rules WHERE artifact_id=? ORDER BY id DESC LIMIT 1",
-        (artifact_id,)
+        "SELECT * FROM yara_rules WHERE artifact_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+        (artifact_id, user["id"])
     ).fetchone()
     indicators = conn.execute(
-        "SELECT type, value FROM indicators WHERE artifact_id=?",
-        (artifact_id,)
+        "SELECT i.type, i.value FROM indicators i JOIN artifacts a ON i.artifact_id=a.id "
+        "WHERE i.artifact_id=? AND a.user_id=?",
+        (artifact_id, user["id"])
     ).fetchall()
     conn.close()
     if not rule:

@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Backend runtime data
+backend/smartyara.db
+backend/uploads/
+__pycache__/
+*.pyc
+
+# Flutter / Dart
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Local Flutter SDK checkout
+/flutter/
