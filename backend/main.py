@@ -7,7 +7,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 app = FastAPI(title="SmartYARA API")
 
@@ -25,6 +25,7 @@ ALGORITHM       = "HS256"
 TOKEN_EXPIRE_MIN = 60 * 8   # 8 hours
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GCP_NLP_API_KEY = os.getenv("GCP_NLP_API_KEY", "")
 
 UPLOAD_DIR = "uploads"
@@ -166,8 +167,11 @@ async def extract_indicators_nlp(text: str) -> list[dict]:
     url = f"https://language.googleapis.com/v1/documents:analyzeEntities?key={GCP_NLP_API_KEY}"
     body = {"document": {"type": "PLAIN_TEXT", "content": text[:5000]},
             "encodingType": "UTF8"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, json=body)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=body)
+    except httpx.HTTPError:   # timeout / network error
+        return extract_indicators_regex(text)
     if r.status_code != 200:
         return extract_indicators_regex(text)   # fallback on error
 
@@ -236,19 +240,22 @@ Raw artifact excerpt (first 1500 chars):
 
 Requirements:
 1. Use a descriptive rule name (no spaces, use underscores).
-2. Include a meta section with description, author="SmartYARA", date, and threat_level.
+2. Include a meta section with description, author="SmartYARA", date="{datetime.now().strftime('%Y-%m-%d')}", and threat_level.
 3. Include a strings section using the most relevant indicators.
 4. Write a condition section that makes logical sense.
 5. Output ONLY the raw YARA rule — no explanation, no markdown fences.
 """
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}")
-    # thinkingBudget=0: otherwise 2.5's thinking tokens eat into maxOutputTokens
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    # thinkingBudget=0: otherwise thinking tokens eat into maxOutputTokens
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024,
                                  "thinkingConfig": {"thinkingBudget": 0}}}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json=body)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=body)
+    except httpx.HTTPError:   # timeout / network error
+        return _fallback_yara(filename, indicators)
     if r.status_code != 200:
         return _fallback_yara(filename, indicators)
     try:
