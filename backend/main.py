@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
-import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt
+import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt, asyncio
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -26,6 +26,7 @@ TOKEN_EXPIRE_MIN = 60 * 8   # 8 hours
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_RETRIES  = 3
 GCP_NLP_API_KEY = os.getenv("GCP_NLP_API_KEY", "")
 
 UPLOAD_DIR = "uploads"
@@ -242,7 +243,9 @@ Requirements:
 1. Use a descriptive rule name (no spaces, use underscores).
 2. Include a meta section with description, author="SmartYARA", date="{datetime.now().strftime('%Y-%m-%d')}", and threat_level.
 3. Include a strings section using the most relevant indicators.
-4. Write a condition section that makes logical sense.
+4. Write a condition section that makes logical sense and avoids false positives:
+   - Never let a file-type check (e.g. uint16(0) == 0x5A4D) match on its own; combine it with AND, never OR.
+   - Require several artifact-specific strings to match, not just one generic string.
 5. Output ONLY the raw YARA rule — no explanation, no markdown fences.
 """
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -251,12 +254,26 @@ Requirements:
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024,
                                  "thinkingConfig": {"thinkingBudget": 0}}}
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(url, json=body)
-    except httpx.HTTPError:   # timeout / network error
-        return _fallback_yara(filename, indicators)
+    # Retry transient failures (overloaded model, rate limit, timeout)
+    reason = ""
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(GEMINI_RETRIES):
+            if attempt:
+                await asyncio.sleep(2 ** attempt)
+            try:
+                r = await client.post(url, json=body)
+            except httpx.HTTPError as e:   # timeout / network error
+                reason = f"{type(e).__name__}"
+                continue
+            if r.status_code in (429, 500, 503):
+                reason = f"HTTP {r.status_code}"
+                continue
+            break
+        else:
+            print(f"[gemini] giving up after {GEMINI_RETRIES} attempts ({reason}), using fallback rule")
+            return _fallback_yara(filename, indicators)
     if r.status_code != 200:
+        print(f"[gemini] HTTP {r.status_code}: {r.text[:300]} — using fallback rule")
         return _fallback_yara(filename, indicators)
     try:
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -264,6 +281,7 @@ Requirements:
         text = re.sub(r'```(?:yara)?\n?', '', text).strip()
         return text
     except (KeyError, IndexError):
+        print(f"[gemini] unexpected response: {r.text[:300]} — using fallback rule")
         return _fallback_yara(filename, indicators)
 
 def _fallback_yara(filename: str, indicators: list[dict]) -> str:
