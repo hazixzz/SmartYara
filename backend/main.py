@@ -178,6 +178,17 @@ def me(user=Depends(get_current_user)):
     return user
 
 # ── NLP: extract indicators via Google Cloud NLP ──────────────────────────────
+# Registry key: full root name or short form (HKLM\ etc.), then the path up to
+# whitespace, a quote or <>. Short forms need the backslash so "HKU" alone isn't a key.
+REGISTRY_KEY_RE = re.compile(
+    r'\b(?:HKEY_[A-Z_]+(?:\\[^\s"\'<>]*)?'
+    r'|HK(?:LM|CU|CR|CC|U)\\[^\s"\'<>]*)',
+    re.I)
+
+def find_registry_keys(text: str) -> list[str]:
+    # drop sentence punctuation that the path pattern swallows ("...\Run.")
+    return [m.group().rstrip('.,;:)') for m in REGISTRY_KEY_RE.finditer(text)]
+
 async def extract_indicators_nlp(text: str) -> list[dict]:
     """Call Google Cloud Natural Language API to extract named entities,
     then map them to malware indicator types."""
@@ -205,12 +216,15 @@ async def extract_indicators_nlp(text: str) -> list[dict]:
             indicators.append({"type": "ip_address", "value": name})
         elif re.match(r'https?://', name):
             indicators.append({"type": "url", "value": name})
-        elif re.match(r'HKEY_', name):
-            indicators.append({"type": "registry_key", "value": name})
+        elif REGISTRY_KEY_RE.match(name):
+            continue   # added below from the raw text, where the full path is intact
         elif re.match(r'.*\.(exe|dll|sys|bat|ps1|vbs)$', name, re.I):
             indicators.append({"type": "file", "value": name})
         elif etype in ("OTHER", "UNKNOWN") and len(name) > 4:
             indicators.append({"type": "string", "value": name})
+    # GCP entities often split a key at its backslashes, so take keys from the text
+    for key in dict.fromkeys(find_registry_keys(text)):
+        indicators.append({"type": "registry_key", "value": key})
     return indicators or extract_indicators_regex(text)
 
 def extract_indicators_regex(text: str) -> list[dict]:
@@ -220,7 +234,6 @@ def extract_indicators_regex(text: str) -> list[dict]:
         ("ip_address",   r'\b\d{1,3}(?:\.\d{1,3}){3}\b'),
         ("domain",       r'\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|ru|cn|io|cc|top|xyz)\b'),
         ("url",          r'https?://[^\s"\'<>]+'),
-        ("registry_key", r'HKEY_[A-Z_\\]+'),
         ("file_path",    r'[A-Za-z]:\\[^\s"\'<>]+'),
         ("api_import",   r'\b(?:CreateProcess|WriteFile|RegSetValue|VirtualAlloc|'
                          r'InternetOpen|LoadLibrary|GetProcAddress|ShellExecute|'
@@ -230,6 +243,8 @@ def extract_indicators_regex(text: str) -> list[dict]:
     for itype, pattern in patterns:
         for m in re.finditer(pattern, text):
             indicators.append({"type": itype, "value": m.group()})
+    for key in find_registry_keys(text):
+        indicators.append({"type": "registry_key", "value": key})
     # deduplicate
     seen = set()
     unique = []
