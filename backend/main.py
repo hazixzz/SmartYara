@@ -25,7 +25,9 @@ ALGORITHM       = "HS256"
 TOKEN_EXPIRE_MIN = 60 * 8   # 8 hours
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# Gemini 3.x uses thinkingLevel (low/medium/high; 3.6 also allows minimal)
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 GEMINI_RETRIES  = 3
 GCP_NLP_API_KEY = os.getenv("GCP_NLP_API_KEY", "")
 
@@ -250,10 +252,11 @@ Requirements:
 """
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
-    # thinkingBudget=0: otherwise thinking tokens eat into maxOutputTokens
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024,
-                                 "thinkingConfig": {"thinkingBudget": 0}}}
+            "generationConfig": {"temperature": 0.2,
+                                 # thinking tokens count toward this limit, so leave headroom
+                                 "maxOutputTokens": 4096,
+                                 "thinkingConfig": _thinking_config(GEMINI_MODEL)}}
     # Retry transient failures (overloaded model, rate limit, timeout)
     reason = ""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -276,13 +279,23 @@ Requirements:
         print(f"[gemini] HTTP {r.status_code}: {r.text[:300]} — using fallback rule")
         return _fallback_yara(filename, indicators)
     try:
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        # skip any thought-summary parts; keep only the answer text
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        if not text.strip():
+            raise KeyError("empty response")
         # Strip markdown fences if Gemini wraps it anyway
         text = re.sub(r'```(?:yara)?\n?', '', text).strip()
         return text
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, ValueError):
         print(f"[gemini] unexpected response: {r.text[:300]} — using fallback rule")
         return _fallback_yara(filename, indicators)
+
+def _thinking_config(model: str) -> dict:
+    """Gemini 2.5 takes thinkingBudget; Gemini 3.x takes thinkingLevel."""
+    if model.startswith("gemini-2"):
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": GEMINI_THINKING_LEVEL}
 
 def _fallback_yara(filename: str, indicators: list[dict]) -> str:
     rule_name = re.sub(r'\W+', '_', filename.rsplit('.', 1)[0]) or "unknown_malware"
@@ -308,15 +321,16 @@ def _fallback_yara(filename: str, indicators: list[dict]) -> str:
 def validate_yara(rule_text: str) -> tuple[bool, str]:
     try:
         import yara
-        yara.compile(source=rule_text)
-        return True, "Rule compiled successfully"
-    except Exception as e:
-        return False, str(e)
     except ImportError:
         # yara-python not installed — do basic structural check
         if "rule " in rule_text and "condition:" in rule_text:
             return True, "Basic structure check passed (yara-python not installed)"
         return False, "Invalid YARA structure"
+    try:
+        yara.compile(source=rule_text)
+        return True, "Rule compiled successfully"
+    except Exception as e:
+        return False, str(e)
 
 # ── Artifact routes ───────────────────────────────────────────────────────────
 @app.post("/artifacts/upload")
