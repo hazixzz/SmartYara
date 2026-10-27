@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
-import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt, asyncio
+import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt, asyncio, time
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -29,8 +29,11 @@ GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 # Gemini 3.x uses thinkingLevel (low/medium/high; 3.6 also allows minimal)
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 GEMINI_RETRIES  = 3
-# Per-attempt timeout; Gemini 3.x can take over a minute under heavy load
+# Per-request timeout; Gemini 3.x can take over a minute under heavy load
 GEMINI_TIMEOUT  = float(os.getenv("GEMINI_TIMEOUT", "90"))
+# Total time shared by ALL Gemini attempts (both models, all retries) before
+# moving on to the local model, so an overloaded Gemini can't stall an upload
+GEMINI_TOTAL_BUDGET = float(os.getenv("GEMINI_TOTAL_BUDGET", "90"))
 # Optional second Gemini model tried if GEMINI_MODEL fails (e.g. gemini-3.5-flash)
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 GCP_NLP_API_KEY = os.getenv("GCP_NLP_API_KEY", "")
@@ -272,9 +275,10 @@ async def generate_yara_rule(filename: str, indicators: list[dict],
     if OLLAMA_ENABLED:
         attempts.append(("ollama", OLLAMA_MODEL))
 
+    gemini_deadline = time.monotonic() + GEMINI_TOTAL_BUDGET
     for provider, model in attempts:
         if provider == "gemini":
-            text, error = await _call_gemini(model, prompt)
+            text, error = await _call_gemini(model, prompt, gemini_deadline)
         else:
             text, error = await _call_ollama(model, prompt)
         if text is None:
@@ -320,8 +324,11 @@ Requirements:
 5. Output ONLY the raw YARA rule — no explanation, no markdown fences.
 """
 
-async def _call_gemini(model: str, prompt: str) -> tuple[Optional[str], str]:
-    """Returns (text, "") on success or (None, reason) on failure."""
+async def _call_gemini(model: str, prompt: str,
+                       deadline: float) -> tuple[Optional[str], str]:
+    """Returns (text, "") on success or (None, reason) on failure.
+    Stops when `deadline` (time.monotonic) is reached. A timeout is not retried
+    on the same model: an overloaded model usually times out again."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     # key goes in a header, not the URL, so it can't leak into logged errors
     headers = {"x-goog-api-key": GEMINI_API_KEY}
@@ -332,21 +339,33 @@ async def _call_gemini(model: str, prompt: str) -> tuple[Optional[str], str]:
                                  "thinkingConfig": _thinking_config(model)}}
     # Retry transient failures (overloaded model, rate limit, timeout)
     reason = ""
-    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+    r = None
+    async with httpx.AsyncClient() as client:
         for attempt in range(GEMINI_RETRIES):
             if attempt:
                 await asyncio.sleep(2 ** attempt)
+            remaining = deadline - time.monotonic()
+            if remaining < 5:
+                reason = (reason + "; " if reason else "") + "Gemini time budget used up"
+                break
             try:
-                r = await client.post(url, json=body, headers=headers)
-            except httpx.HTTPError as e:   # timeout / network error
+                r = await client.post(url, json=body, headers=headers,
+                                      timeout=min(GEMINI_TIMEOUT, remaining))
+            except httpx.TimeoutException:
+                reason = f"timed out after {min(GEMINI_TIMEOUT, remaining):.0f}s"
+                r = None
+                break          # don't retry a model that is timing out
+            except httpx.HTTPError as e:   # network error
                 reason = type(e).__name__
+                r = None
                 continue
             if r.status_code in (429, 500, 503):
                 reason = f"HTTP {r.status_code}"
+                r = None
                 continue
             break
-        else:
-            return None, f"{reason} after {GEMINI_RETRIES} attempts"
+    if r is None:
+        return None, f"{reason} (attempt {attempt + 1}/{GEMINI_RETRIES})"
     if r.status_code != 200:
         try:
             detail = r.json()["error"]["message"]
