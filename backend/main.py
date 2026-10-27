@@ -29,7 +29,18 @@ GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 # Gemini 3.x uses thinkingLevel (low/medium/high; 3.6 also allows minimal)
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 GEMINI_RETRIES  = 3
+# Per-attempt timeout; Gemini 3.x can take over a minute under heavy load
+GEMINI_TIMEOUT  = float(os.getenv("GEMINI_TIMEOUT", "90"))
+# Optional second Gemini model tried if GEMINI_MODEL fails (e.g. gemini-3.5-flash)
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 GCP_NLP_API_KEY = os.getenv("GCP_NLP_API_KEY", "")
+
+# Local Ollama model, tried after Gemini and before the template rule
+OLLAMA_ENABLED  = os.getenv("OLLAMA_ENABLED", "true").lower() in ("1", "true", "yes")
+OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:3b")
+OLLAMA_TIMEOUT  = 120    # seconds; local models can be slow
+OLLAMA_NUM_CTX  = 4096   # small context keeps a 3B model fully on a 4 GB GPU
 
 UPLOAD_DIR = "uploads"
 DB_PATH    = "smartyara.db"
@@ -76,10 +87,16 @@ def init_db():
             is_valid    INTEGER DEFAULT 0,
             created     TEXT DEFAULT CURRENT_TIMESTAMP,
             user_id     INTEGER,
+            generated_by TEXT,
             FOREIGN KEY(artifact_id) REFERENCES artifacts(id),
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
     """)
+    # Migrate databases created before generated_by existed
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(yara_rules)")]
+    if "generated_by" not in cols:
+        conn.execute("ALTER TABLE yara_rules ADD COLUMN generated_by TEXT")
+        conn.commit()
     # Seed an admin user only if ADMIN_PASSWORD is set in the environment
     admin_pw = os.getenv("ADMIN_PASSWORD")
     if admin_pw:
@@ -223,15 +240,50 @@ def extract_indicators_regex(text: str) -> list[dict]:
             unique.append(ind)
     return unique
 
-# ── LLM: generate YARA rule via Gemini ───────────────────────────────────────
-async def generate_yara_rule(filename: str, indicators: list[dict], raw_text: str) -> str:
-    if not GEMINI_API_KEY:
-        return _fallback_yara(filename, indicators)
+# ── LLM: generate YARA rule (Gemini → fallback Gemini → Ollama → template) ───
+async def generate_yara_rule(filename: str, indicators: list[dict],
+                             raw_text: str) -> tuple[str, str]:
+    """Returns (rule_text, generated_by), where generated_by is
+    "gemini:<model>", "ollama:<model>" or "template"."""
+    prompt = _build_prompt(filename, indicators, raw_text)
 
+    attempts = []
+    if GEMINI_API_KEY:
+        attempts.append(("gemini", GEMINI_MODEL))
+        if GEMINI_FALLBACK_MODEL:
+            attempts.append(("gemini", GEMINI_FALLBACK_MODEL))
+    else:
+        print("[gemini] skipped: GEMINI_API_KEY not set")
+    if OLLAMA_ENABLED:
+        attempts.append(("ollama", OLLAMA_MODEL))
+
+    for provider, model in attempts:
+        if provider == "gemini":
+            text, error = await _call_gemini(model, prompt)
+        else:
+            text, error = await _call_ollama(model, prompt)
+        if text is None:
+            print(f"[{provider}] {model}: {error}")
+            continue
+        text = _clean_rule(text)
+        if "rule " not in text or "condition:" not in text:
+            print(f"[{provider}] {model}: output is not a YARA rule")
+            continue
+        ok, msg = validate_yara(text)
+        if not ok:
+            print(f"[{provider}] {model}: rule did not compile: {msg}")
+            continue
+        return text, f"{provider}:{model}"
+
+    print("[generate] no LLM produced a valid rule, using template")
+    return _fallback_yara(filename, indicators), "template"
+
+def _build_prompt(filename: str, indicators: list[dict], raw_text: str) -> str:
+    """Same prompt for every model, so Gemini and local rules are comparable."""
     indicator_summary = "\n".join(
         f"- [{i['type']}] {i['value']}" for i in indicators[:30]
     )
-    prompt = f"""You are a malware analyst. Generate a valid YARA rule for the following malware artifact.
+    return f"""You are a malware analyst. Generate a valid YARA rule for the following malware artifact.
 
 Artifact filename: {filename}
 
@@ -244,52 +296,96 @@ Raw artifact excerpt (first 1500 chars):
 Requirements:
 1. Use a descriptive rule name (no spaces, use underscores).
 2. Include a meta section with description, author="SmartYARA", date="{datetime.now().strftime('%Y-%m-%d')}", and threat_level.
-3. Include a strings section using the most relevant indicators.
+3. Include a strings section using the most relevant indicators. Write each one as a
+   plain text string in double quotes, copied exactly from the indicators above
+   (escape each backslash as \\\\). Do not convert strings to hex.
 4. Write a condition section that makes logical sense and avoids false positives:
    - Never let a file-type check (e.g. uint16(0) == 0x5A4D) match on its own; combine it with AND, never OR.
    - Require several artifact-specific strings to match, not just one generic string.
 5. Output ONLY the raw YARA rule — no explanation, no markdown fences.
 """
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+
+async def _call_gemini(model: str, prompt: str) -> tuple[Optional[str], str]:
+    """Returns (text, "") on success or (None, reason) on failure."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    # key goes in a header, not the URL, so it can't leak into logged errors
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2,
                                  # thinking tokens count toward this limit, so leave headroom
                                  "maxOutputTokens": 4096,
-                                 "thinkingConfig": _thinking_config(GEMINI_MODEL)}}
+                                 "thinkingConfig": _thinking_config(model)}}
     # Retry transient failures (overloaded model, rate limit, timeout)
     reason = ""
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
         for attempt in range(GEMINI_RETRIES):
             if attempt:
                 await asyncio.sleep(2 ** attempt)
             try:
-                r = await client.post(url, json=body)
+                r = await client.post(url, json=body, headers=headers)
             except httpx.HTTPError as e:   # timeout / network error
-                reason = f"{type(e).__name__}"
+                reason = type(e).__name__
                 continue
             if r.status_code in (429, 500, 503):
                 reason = f"HTTP {r.status_code}"
                 continue
             break
         else:
-            print(f"[gemini] giving up after {GEMINI_RETRIES} attempts ({reason}), using fallback rule")
-            return _fallback_yara(filename, indicators)
+            return None, f"{reason} after {GEMINI_RETRIES} attempts"
     if r.status_code != 200:
-        print(f"[gemini] HTTP {r.status_code}: {r.text[:300]} — using fallback rule")
-        return _fallback_yara(filename, indicators)
+        try:
+            detail = r.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            detail = r.text
+        return None, f"HTTP {r.status_code}: {detail[:200]}"
     try:
         parts = r.json()["candidates"][0]["content"]["parts"]
         # skip any thought-summary parts; keep only the answer text
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-        if not text.strip():
-            raise KeyError("empty response")
-        # Strip markdown fences if Gemini wraps it anyway
-        text = re.sub(r'```(?:yara)?\n?', '', text).strip()
-        return text
     except (KeyError, IndexError, ValueError):
-        print(f"[gemini] unexpected response: {r.text[:300]} — using fallback rule")
-        return _fallback_yara(filename, indicators)
+        return None, f"unexpected response: {r.text[:200]}"
+    if not text.strip():
+        return None, "empty response"
+    return text, ""
+
+async def _call_ollama(model: str, prompt: str) -> tuple[Optional[str], str]:
+    """Returns (text, "") on success or (None, reason) on failure."""
+    body = {"model": model, "stream": False,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": 0.2, "num_predict": 1024,
+                        "num_ctx": OLLAMA_NUM_CTX}}
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+            r = await client.post(f"{OLLAMA_URL}/api/chat", json=body)
+    except httpx.ConnectError:
+        return None, f"unreachable at {OLLAMA_URL} (is Ollama running?)"
+    except httpx.HTTPError as e:   # timeout / network error
+        return None, type(e).__name__
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        text = r.json()["message"]["content"]
+    except (KeyError, ValueError):
+        return None, f"unexpected response: {r.text[:200]}"
+    if not text.strip():
+        return None, "empty response"
+    return text, ""
+
+def _clean_rule(text: str) -> str:
+    """Extract the YARA rule from model output that may add fences or chatter."""
+    fenced = re.search(r'```[a-zA-Z]*\n(.*?)```', text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    text = re.sub(r'```[a-zA-Z]*\n?', '', text)
+    # Drop any preamble before the first import/rule line ...
+    start = re.search(r'^\s*(?:import\s+"|(?:(?:private|global)\s+)*rule\s)', text, re.M)
+    if start:
+        text = text[start.start():]
+    # ... and any explanation after the rule's closing brace
+    end = text.rfind("}")
+    if end != -1:
+        text = text[:end + 1]
+    return text.strip()
 
 def _thinking_config(model: str) -> dict:
     """Gemini 2.5 takes thinkingBudget; Gemini 3.x takes thinkingLevel."""
@@ -368,11 +464,12 @@ async def upload_artifact(file: UploadFile = File(...),
     conn.commit()
 
     # LLM YARA generation
-    rule_text = await generate_yara_rule(file.filename, indicators, text)
+    rule_text, generated_by = await generate_yara_rule(file.filename, indicators, text)
     is_valid, validation_msg = validate_yara(rule_text)
     conn.execute(
-        "INSERT INTO yara_rules (artifact_id, rule_text, is_valid, user_id) VALUES (?,?,?,?)",
-        (artifact_id, rule_text, 1 if is_valid else 0, user["id"])
+        "INSERT INTO yara_rules (artifact_id, rule_text, is_valid, user_id, generated_by) "
+        "VALUES (?,?,?,?,?)",
+        (artifact_id, rule_text, 1 if is_valid else 0, user["id"], generated_by)
     )
     conn.commit()
     conn.close()
@@ -385,6 +482,7 @@ async def upload_artifact(file: UploadFile = File(...),
         "yara_rule":   rule_text,
         "is_valid":    is_valid,
         "validation":  validation_msg,
+        "generated_by": generated_by,
     }
 
 @app.get("/artifacts")
