@@ -116,8 +116,96 @@ If `flutter` is not recognized, make sure the Flutter SDK is installed and the `
    - Example: `CreateProcess HKEY_LOCAL_MACHINE\Software\evil.exe 192.168.1.100`
 5. Backend extracts indicators and generates a YARA rule
 6. Review the generated rule on the Rule Review screen
-7. Complete the analyst checklist
-8. Export the final rule
+7. Edit the rule if needed, add a change note and click **Save & Validate**
+   (a rule that doesn't compile is rejected and the YARA error is shown)
+8. Complete the analyst checklist and click **Approve Rule**
+9. Click **Export .yar** to download the approved rule
+10. Open **History** (top bar) to search and filter all artifacts and rules;
+    **History** on the Rule Review screen shows every version of a rule
+
+---
+
+## Features
+
+- **Upload checks:** only text files (`.txt .log .json .csv .xml .md`), at most
+  `MAX_UPLOAD_MB` (default 5 MB); empty and binary files are rejected. Files are
+  stored as `uploads/<random-id>.<ext>`, never under the name the client sent.
+- **Rule generation:** Gemini → optional second Gemini model → local Ollama model
+  → fallback template. Each rule records which one wrote it (`generated_by`).
+- **Edit & validate:** edits are saved only if they compile with yara-python.
+- **Version history:** every generated, edited or restored rule text is kept as
+  a numbered version; restoring copies an old version into a new one, so
+  history is never overwritten or deleted.
+- **Approval:** a rule can be approved only when it compiles and every
+  checklist item is ticked (checked by the server). Editing or restoring an
+  approved rule sends it back to draft.
+- **Export:** approved rules download as a `.yar` file with a header
+  (version, approver, generator).
+- **History:** search by filename and filter by status, generator and date.
+- Each user only sees their own artifacts and rules; anyone else's rule
+  returns 404.
+
+---
+
+## API endpoints
+
+All endpoints except register/login need `Authorization: Bearer <token>`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/auth/register` | Create an account |
+| POST | `/auth/login` | Log in, returns a JWT access token |
+| GET | `/auth/me` | Current user from the token |
+| POST | `/artifacts/upload` | Upload a text artifact; extracts indicators, generates and validates a rule (version 1) |
+| GET | `/artifacts` | List my artifacts with rule status; filters `q`, `status`, `generated_by`, `date_from`, `date_to` |
+| GET | `/artifacts/{artifact_id}/rule` | The artifact's rule, indicators and checklist items |
+| PUT | `/rules/{rule_id}` | Save an edited rule as a new version (422 if it doesn't compile) |
+| GET | `/rules/{rule_id}/versions` | List a rule's versions, newest first |
+| GET | `/rules/{rule_id}/versions/{version}` | One version's full text |
+| POST | `/rules/{rule_id}/versions/{version}/restore` | Copy an old version into a new version |
+| POST | `/rules/{rule_id}/approve` | Approve with the completed checklist |
+| GET | `/rules/{rule_id}/export` | Download an approved rule as `.yar` |
+| GET | `/dashboard/stats` | Counts of artifacts, rules, approved/draft rules, indicators |
+
+Interactive docs: http://127.0.0.1:8000/docs
+
+---
+
+## Settings (`backend/.env`)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `GEMINI_API_KEY` | – | Gemini key; without it Gemini is skipped |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Main Gemini model |
+| `GEMINI_FALLBACK_MODEL` | empty | Optional second Gemini model |
+| `GEMINI_TIMEOUT` / `GEMINI_TOTAL_BUDGET` | `90` / `90` | Seconds per Gemini request / for all Gemini attempts |
+| `OLLAMA_ENABLED`, `OLLAMA_URL`, `OLLAMA_MODEL` | `true`, `http://127.0.0.1:11434`, `qwen2.5-coder:3b` | Local backup model |
+| `GCP_NLP_API_KEY` | – | Google NLP; without it indicators come from regex |
+| `MAX_UPLOAD_MB` | `5` | Largest accepted upload |
+| `ALLOWED_EXTENSIONS` | `txt,log,json,csv,xml,md` | Accepted upload types (keep the frontend picker in sync) |
+| `DB_PATH` / `UPLOAD_DIR` | `smartyara.db` / `uploads` | Database file and upload folder (the tests use temporary ones) |
+
+When the backend starts on an older database, it adds the new columns and
+tables in place and first saves a copy as `smartyara.db.<timestamp>.bak`.
+
+---
+
+## Running the tests
+
+From `backend/` (no API keys or network needed; the tests use a temporary
+database and never call Gemini or Ollama):
+
+```powershell
+python test_indicators.py
+python test_phase1.py
+```
+
+Both also run under `pytest` if you install it. For the frontend:
+
+```powershell
+cd frontend
+flutter analyze
+```
 
 ---
 
@@ -126,6 +214,8 @@ If `flutter` is not recognized, make sure the Flutter SDK is installed and the `
 - The frontend expects the backend at `http://127.0.0.1:8000`
 - Make sure the backend is running before logging in
 - If no API keys are set, the backend falls back to regex-based extraction
+- **Export .yar** downloads the file in the web app (Chrome); on Windows
+  desktop use **Copy Rule** instead
 
 ---
 
@@ -140,3 +230,14 @@ If `flutter` is not recognized, make sure the Flutter SDK is installed and the `
 | `yara-python` install fails | `pip install yara-python --break-system-packages` |
 | NLP returns no indicators | The app falls back to regex extraction automatically |
 | Gemini API errors | The app uses a fallback YARA template |
+
+
+cd C:\Users\ctcom\OneDrive\Documents\GitHub\SmartYara\backend
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload --port 8000
+
+
+cd C:\Users\ctcom\OneDrive\Documents\GitHub\SmartYara\frontend
+$env:Path = "$PWD\..\flutter\bin;$env:Path"
+flutter pub get
+flutter run -d chrome
