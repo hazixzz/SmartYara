@@ -15,3 +15,6 @@ build/
 
 # Local Flutter SDK checkout
 /flutter/
+
+# Database backups made before schema migrations
+*.bak

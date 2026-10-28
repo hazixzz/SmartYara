@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -87,10 +87,34 @@ def _too_large_message() -> str:
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+# Columns added to yara_rules after the first release, with their ALTER TABLE type
+YARA_RULE_MIGRATIONS = {
+    "generated_by":    "TEXT",
+    "status":          "TEXT DEFAULT 'draft'",   # 'draft' | 'approved'
+    "approved_by":     "INTEGER REFERENCES users(id)",
+    "approved_at":     "TEXT",
+    "checklist":       "TEXT",                   # JSON of the checklist at approval
+    "current_version": "INTEGER DEFAULT 1",
+}
+
+def _backup_before_migration(conn):
+    """Copy the DB file once before changing an existing schema."""
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "yara_rules" not in tables:
+        return   # brand-new database, nothing to protect
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(yara_rules)")}
+    if "rule_versions" in tables and set(YARA_RULE_MIGRATIONS) <= cols:
+        return   # already up to date
+    backup = f"{DB_PATH}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+    shutil.copy2(DB_PATH, backup)
+    print(f"[db] backed up database to {backup} before migrating")
 
 def init_db():
     conn = get_db()
+    _backup_before_migration(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,15 +147,46 @@ def init_db():
             created     TEXT DEFAULT CURRENT_TIMESTAMP,
             user_id     INTEGER,
             generated_by TEXT,
+            status      TEXT DEFAULT 'draft',
+            approved_by INTEGER,
+            approved_at TEXT,
+            checklist   TEXT,
+            current_version INTEGER DEFAULT 1,
             FOREIGN KEY(artifact_id) REFERENCES artifacts(id),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(approved_by) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS rule_versions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id        INTEGER NOT NULL,
+            version        INTEGER NOT NULL,
+            rule_text      TEXT NOT NULL,
+            is_valid       INTEGER DEFAULT 0,
+            validation_msg TEXT,
+            source         TEXT NOT NULL,      -- 'generated' | 'edited' | 'restored'
+            change_note    TEXT,
+            created_by     INTEGER,
+            created        TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(rule_id) REFERENCES yara_rules(id),
+            FOREIGN KEY(created_by) REFERENCES users(id),
+            UNIQUE(rule_id, version)
         );
     """)
-    # Migrate databases created before generated_by existed
+    # Migrate databases created before these yara_rules columns existed
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(yara_rules)")]
-    if "generated_by" not in cols:
-        conn.execute("ALTER TABLE yara_rules ADD COLUMN generated_by TEXT")
-        conn.commit()
+    for col, coltype in YARA_RULE_MIGRATIONS.items():
+        if col not in cols:
+            conn.execute(f"ALTER TABLE yara_rules ADD COLUMN {col} {coltype}")
+    # Every rule needs a version 1 in its history
+    conn.execute("""
+        INSERT INTO rule_versions (rule_id, version, rule_text, is_valid, source,
+                                   change_note, created_by, created)
+        SELECT r.id, 1, COALESCE(r.rule_text, ''), r.is_valid, 'generated',
+               'migrated from existing rule', r.user_id, r.created
+        FROM yara_rules r
+        WHERE NOT EXISTS (SELECT 1 FROM rule_versions v WHERE v.rule_id = r.id)
+    """)
+    conn.commit()
     # Seed an admin user only if ADMIN_PASSWORD is set in the environment
     admin_pw = os.getenv("ADMIN_PASSWORD")
     if admin_pw:
@@ -571,16 +626,22 @@ async def upload_artifact(file: UploadFile = File(...),
     # LLM YARA generation
     rule_text, generated_by = await generate_yara_rule(display_name, indicators, text)
     is_valid, validation_msg = validate_yara(rule_text)
-    conn.execute(
-        "INSERT INTO yara_rules (artifact_id, rule_text, is_valid, user_id, generated_by) "
-        "VALUES (?,?,?,?,?)",
+    cur = conn.execute(
+        "INSERT INTO yara_rules (artifact_id, rule_text, is_valid, user_id, generated_by, "
+        "status, current_version) VALUES (?,?,?,?,?,'draft',1)",
         (artifact_id, rule_text, 1 if is_valid else 0, user["id"], generated_by)
     )
+    rule_id = cur.lastrowid
+    _add_version(conn, rule_id, 1, rule_text, is_valid, validation_msg,
+                 "generated", None, user["id"])
     conn.commit()
     conn.close()
 
     return {
         "artifact_id": artifact_id,
+        "rule_id":     rule_id,
+        "status":      "draft",
+        "current_version": 1,
         "filename":    display_name,
         "filehash":    filehash,
         "indicators":  indicators,
@@ -590,14 +651,59 @@ async def upload_artifact(file: UploadFile = File(...),
         "generated_by": generated_by,
     }
 
+RULE_STATUSES = ("draft", "approved")
+
+def _parse_date(value: Optional[str], name: str) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{name} must be YYYY-MM-DD")
+
 @app.get("/artifacts")
-def list_artifacts(user=Depends(get_current_user)):
+def list_artifacts(q: Optional[str] = None,
+                   status_filter: Optional[str] = Query(None, alias="status"),
+                   generated_by: Optional[str] = None,
+                   date_from: Optional[str] = None,
+                   date_to: Optional[str] = None,
+                   user=Depends(get_current_user)):
+    """The user's artifacts with their rule's status. Optional filters:
+    q (filename contains), status, generated_by (prefix: gemini/ollama/template),
+    date_from / date_to (YYYY-MM-DD, inclusive, upload date in UTC)."""
+    where, params = ["a.user_id=?"], [user["id"]]
+    if q:
+        # treat % and _ in the search box literally
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append("a.filename LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
+    if status_filter:
+        if status_filter not in RULE_STATUSES:
+            raise HTTPException(status_code=400,
+                                detail=f"status must be one of: {', '.join(RULE_STATUSES)}")
+        where.append("r.status=?")
+        params.append(status_filter)
+    if generated_by:
+        where.append("r.generated_by LIKE ?")
+        params.append(generated_by.replace("%", "").replace("_", "") + "%")
+    start, end = _parse_date(date_from, "date_from"), _parse_date(date_to, "date_to")
+    if start:
+        where.append("a.uploaded >= ?")
+        params.append(start)
+    if end:
+        where.append("a.uploaded < date(?, '+1 day')")
+        params.append(end)
+
     conn = get_db()
     rows = conn.execute(
-        "SELECT a.*, COUNT(i.id) as indicator_count "
-        "FROM artifacts a LEFT JOIN indicators i ON a.id=i.artifact_id "
-        "WHERE a.user_id=? GROUP BY a.id ORDER BY a.uploaded DESC",
-        (user["id"],)
+        "SELECT a.id, a.filename, a.filehash, a.uploaded, a.user_id, "
+        "  (SELECT COUNT(*) FROM indicators i WHERE i.artifact_id=a.id) AS indicator_count, "
+        "  r.id AS rule_id, r.status, r.generated_by, r.current_version, r.is_valid "
+        "FROM artifacts a "
+        "LEFT JOIN yara_rules r ON r.id = "
+        "  (SELECT MAX(id) FROM yara_rules WHERE artifact_id=a.id) "
+        f"WHERE {' AND '.join(where)} ORDER BY a.uploaded DESC, a.id DESC",
+        params
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -606,7 +712,9 @@ def list_artifacts(user=Depends(get_current_user)):
 def get_rule(artifact_id: int, user=Depends(get_current_user)):
     conn = get_db()
     rule = conn.execute(
-        "SELECT * FROM yara_rules WHERE artifact_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT r.*, u.username AS approved_by_name FROM yara_rules r "
+        "LEFT JOIN users u ON u.id = r.approved_by "
+        "WHERE r.artifact_id=? AND r.user_id=? ORDER BY r.id DESC LIMIT 1",
         (artifact_id, user["id"])
     ).fetchone()
     indicators = conn.execute(
@@ -617,7 +725,192 @@ def get_rule(artifact_id: int, user=Depends(get_current_user)):
     conn.close()
     if not rule:
         raise HTTPException(status_code=404, detail="No rule found")
-    return {"rule": dict(rule), "indicators": [dict(i) for i in indicators]}
+    rule = dict(rule)
+    rule["checklist"] = json.loads(rule["checklist"]) if rule["checklist"] else None
+    return {"rule": rule, "indicators": [dict(i) for i in indicators],
+            "checklist_items": REVIEW_CHECKLIST}
+
+# ── Rule review: edit, versions, approve, export ──────────────────────────────
+# The analyst checklist; approval requires every item to be ticked
+REVIEW_CHECKLIST = [
+    "Rule name is descriptive",
+    "Strings section is relevant",
+    "Condition logic is correct",
+    "No false positive risk detected",
+    "Meta information is complete",
+    "Rule compiles without errors",
+]
+MAX_RULE_BYTES  = 100 * 1024
+MAX_NOTE_LENGTH = 500
+
+class RuleEditRequest(BaseModel):
+    rule_text: str
+    change_note: Optional[str] = None
+
+class ApproveRequest(BaseModel):
+    checklist: dict[str, bool]
+
+def _owned_rule(conn, rule_id: int, user) -> sqlite3.Row:
+    """The rule if it belongs to the current user; otherwise 404 (not 403),
+    so other users' rule ids can't be probed."""
+    rule = conn.execute("SELECT * FROM yara_rules WHERE id=? AND user_id=?",
+                        (rule_id, user["id"])).fetchone()
+    if not rule:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return rule
+
+def _add_version(conn, rule_id: int, version: int, rule_text: str, is_valid: bool,
+                 validation_msg: str, source: str, change_note: Optional[str],
+                 user_id: int):
+    conn.execute(
+        "INSERT INTO rule_versions (rule_id, version, rule_text, is_valid, validation_msg, "
+        "source, change_note, created_by) VALUES (?,?,?,?,?,?,?,?)",
+        (rule_id, version, rule_text, 1 if is_valid else 0, validation_msg,
+         source, change_note, user_id)
+    )
+
+def _save_new_version(conn, rule, rule_text: str, is_valid: bool, validation_msg: str,
+                      source: str, change_note: Optional[str], user) -> int:
+    """Append a version and make it current. History is never overwritten,
+    and any change sends an approved rule back to draft for re-approval."""
+    version = conn.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM rule_versions "
+                           "WHERE rule_id=?", (rule["id"],)).fetchone()[0]
+    _add_version(conn, rule["id"], version, rule_text, is_valid, validation_msg,
+                 source, change_note, user["id"])
+    conn.execute(
+        "UPDATE yara_rules SET rule_text=?, is_valid=?, current_version=?, status='draft', "
+        "approved_by=NULL, approved_at=NULL, checklist=NULL WHERE id=?",
+        (rule_text, 1 if is_valid else 0, version, rule["id"])
+    )
+    conn.commit()
+    return version
+
+def _rule_summary(conn, rule_id: int) -> dict:
+    rule = conn.execute(
+        "SELECT r.id, r.artifact_id, r.rule_text, r.is_valid, r.status, r.current_version, "
+        "r.generated_by, r.approved_at, u.username AS approved_by_name "
+        "FROM yara_rules r LEFT JOIN users u ON u.id = r.approved_by WHERE r.id=?",
+        (rule_id,)).fetchone()
+    return dict(rule)
+
+@app.put("/rules/{rule_id}")
+def edit_rule(rule_id: int, req: RuleEditRequest, user=Depends(get_current_user)):
+    rule_text = req.rule_text.strip()
+    if not rule_text:
+        raise HTTPException(status_code=400, detail="Rule text is empty")
+    if len(rule_text.encode()) > MAX_RULE_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"Rule is too long (max {MAX_RULE_BYTES // 1024} KB)")
+    note = (req.change_note or "").strip()[:MAX_NOTE_LENGTH] or None
+
+    conn = get_db()
+    rule = _owned_rule(conn, rule_id, user)
+    if rule_text == (rule["rule_text"] or "").strip():
+        conn.close()
+        raise HTTPException(status_code=400, detail="No changes to save")
+    is_valid, msg = validate_yara(rule_text)
+    if not is_valid:
+        conn.close()
+        raise HTTPException(status_code=422, detail=f"Rule does not compile: {msg}")
+    version = _save_new_version(conn, rule, rule_text, True, msg, "edited", note, user)
+    result = _rule_summary(conn, rule_id)
+    conn.close()
+    return {"message": f"Saved as version {version}", "rule": result}
+
+@app.get("/rules/{rule_id}/versions")
+def list_versions(rule_id: int, user=Depends(get_current_user)):
+    conn = get_db()
+    _owned_rule(conn, rule_id, user)
+    rows = conn.execute(
+        "SELECT v.version, v.source, v.change_note, v.is_valid, v.validation_msg, "
+        "v.created, u.username AS created_by_name "
+        "FROM rule_versions v LEFT JOIN users u ON u.id = v.created_by "
+        "WHERE v.rule_id=? ORDER BY v.version DESC", (rule_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.get("/rules/{rule_id}/versions/{version}")
+def get_version(rule_id: int, version: int, user=Depends(get_current_user)):
+    conn = get_db()
+    _owned_rule(conn, rule_id, user)
+    row = conn.execute(
+        "SELECT v.*, u.username AS created_by_name FROM rule_versions v "
+        "LEFT JOIN users u ON u.id = v.created_by WHERE v.rule_id=? AND v.version=?",
+        (rule_id, version)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return dict(row)
+
+@app.post("/rules/{rule_id}/versions/{version}/restore")
+def restore_version(rule_id: int, version: int, user=Depends(get_current_user)):
+    conn = get_db()
+    rule = _owned_rule(conn, rule_id, user)
+    old = conn.execute("SELECT rule_text FROM rule_versions WHERE rule_id=? AND version=?",
+                       (rule_id, version)).fetchone()
+    if not old:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Version not found")
+    if old["rule_text"].strip() == (rule["rule_text"] or "").strip():
+        conn.close()
+        raise HTTPException(status_code=400,
+                            detail=f"Version {version} is the same as the current rule")
+    is_valid, msg = validate_yara(old["rule_text"])
+    new_version = _save_new_version(conn, rule, old["rule_text"], is_valid, msg,
+                                    "restored", f"Restored from version {version}", user)
+    result = _rule_summary(conn, rule_id)
+    conn.close()
+    return {"message": f"Version {version} restored as version {new_version}",
+            "rule": result}
+
+@app.post("/rules/{rule_id}/approve")
+def approve_rule(rule_id: int, req: ApproveRequest, user=Depends(get_current_user)):
+    conn = get_db()
+    rule = _owned_rule(conn, rule_id, user)
+    if rule["status"] == "approved":
+        conn.close()
+        raise HTTPException(status_code=409, detail="Rule is already approved")
+    # check on the server too; never trust the UI's checklist state
+    missing = [item for item in REVIEW_CHECKLIST if req.checklist.get(item) is not True]
+    if missing:
+        conn.close()
+        raise HTTPException(status_code=400,
+                            detail=f"Checklist incomplete: {'; '.join(missing)}")
+    is_valid, msg = validate_yara(rule["rule_text"] or "")
+    if not is_valid:
+        conn.close()
+        raise HTTPException(status_code=400,
+                            detail=f"Cannot approve a rule that does not compile: {msg}")
+    checklist = {item: True for item in REVIEW_CHECKLIST}
+    conn.execute(
+        "UPDATE yara_rules SET status='approved', approved_by=?, approved_at=?, checklist=? "
+        "WHERE id=?",
+        (user["id"], datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+         json.dumps(checklist), rule_id))
+    conn.commit()
+    result = _rule_summary(conn, rule_id)
+    conn.close()
+    return {"message": "Rule approved", "rule": result}
+
+@app.get("/rules/{rule_id}/export")
+def export_rule(rule_id: int, user=Depends(get_current_user)):
+    conn = get_db()
+    _owned_rule(conn, rule_id, user)
+    rule = _rule_summary(conn, rule_id)
+    conn.close()
+    if rule["status"] != "approved":
+        raise HTTPException(status_code=409, detail="Only approved rules can be exported")
+    match = re.search(r'\brule\s+([A-Za-z_]\w*)', rule["rule_text"])
+    name = match.group(1) if match else f"smartyara_rule_{rule_id}"
+    header = (f"// Generated by SmartYARA\n"
+              f"// Rule ID: {rule_id}, version {rule['current_version']}\n"
+              f"// Approved by: {rule['approved_by_name']} at {rule['approved_at']} UTC\n"
+              f"// Generated by: {rule['generated_by'] or 'unknown'}\n"
+              f"// Exported: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n")
+    return Response(content=header + rule["rule_text"] + "\n",
+                    media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.yar"'})
 
 @app.get("/dashboard/stats")
 def dashboard_stats(user=Depends(get_current_user)):
@@ -635,10 +928,15 @@ def dashboard_stats(user=Depends(get_current_user)):
         "SELECT COUNT(*) FROM indicators i JOIN artifacts a ON i.artifact_id=a.id WHERE a.user_id=?",
         (user["id"],)
     ).fetchone()[0]
+    approved_rules = conn.execute(
+        "SELECT COUNT(*) FROM yara_rules WHERE user_id=? AND status='approved'", (user["id"],)
+    ).fetchone()[0]
     conn.close()
     return {
         "total_artifacts":  total_artifacts,
         "total_rules":      total_rules,
         "valid_rules":      valid_rules,
         "total_indicators": total_indicators,
+        "approved_rules":   approved_rules,
+        "draft_rules":      total_rules - approved_rules,
     }
