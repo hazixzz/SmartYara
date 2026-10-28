@@ -1,11 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
-import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt, asyncio, time
+import sqlite3, os, hashlib, jwt, shutil, httpx, json, re, bcrypt, asyncio, time, uuid
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -17,6 +18,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # lets the web app read the export filename
+    expose_headers=["Content-Disposition"],
 )
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -45,11 +48,40 @@ OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:3b")
 OLLAMA_TIMEOUT  = 120    # seconds; local models can be slow
 OLLAMA_NUM_CTX  = 4096   # small context keeps a 3B model fully on a 4 GB GPU
 
-UPLOAD_DIR = "uploads"
-DB_PATH    = "smartyara.db"
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+DB_PATH    = os.getenv("DB_PATH", "smartyara.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Upload checks (misuse case: uploading a malicious file)
+ALLOWED_EXTENSIONS = [e.strip().lower().lstrip(".") for e in
+                      os.getenv("ALLOWED_EXTENSIONS", "txt,log,json,csv,xml,md").split(",")
+                      if e.strip()]
+MAX_UPLOAD_MB    = float(os.getenv("MAX_UPLOAD_MB", "5"))
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+UPLOAD_CHUNK     = 64 * 1024
+BINARY_SNIFF_BYTES = 8192   # look for NUL bytes in this much of the file
+MAX_NUL_RATIO      = 0.01
+MAX_DISPLAY_NAME   = 100
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+@app.middleware("http")
+async def reject_oversized_uploads(request: Request, call_next):
+    # FastAPI parses the whole multipart body before the route runs, so turn
+    # away oversized uploads by their declared size first. The route still
+    # counts the bytes itself for clients that send no Content-Length.
+    if request.url.path == "/artifacts/upload":
+        try:
+            declared = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        if declared > MAX_UPLOAD_BYTES + 64 * 1024:   # allow for multipart overhead
+            return JSONResponse(status_code=413,
+                                content={"detail": _too_large_message()})
+    return await call_next(request)
+
+def _too_large_message() -> str:
+    return f"File too large (max {MAX_UPLOAD_MB:g} MB)"
 
 # ── Database ─────────────────────────────────────────────────────────────────
 def get_db():
@@ -463,13 +495,52 @@ def validate_yara(rule_text: str) -> tuple[bool, str]:
         return False, str(e)
 
 # ── Artifact routes ───────────────────────────────────────────────────────────
+def clean_display_name(filename: Optional[str]) -> str:
+    """Basename only, safe characters, at most MAX_DISPLAY_NAME chars.
+    Only ever shown to users; files are stored under a random name."""
+    name = re.split(r'[\\/]', filename or "")[-1]
+    name = re.sub(r'[^A-Za-z0-9._ ()-]', '_', name).strip(" .")
+    if not name:
+        return "artifact"
+    if len(name) > MAX_DISPLAY_NAME:
+        stem, dot, ext = name.rpartition(".")
+        if dot and len(ext) <= 10:   # shorten the stem, keep the extension
+            name = stem[:MAX_DISPLAY_NAME - len(ext) - 1] + "." + ext
+        else:
+            name = name[:MAX_DISPLAY_NAME]
+    return name
+
+async def read_checked_upload(file: UploadFile) -> tuple[bytes, str]:
+    """Returns (content, extension) or raises 400/413 for files we won't process."""
+    display = clean_display_name(file.filename)
+    ext = display.rpartition(".")[2].lower() if "." in display else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unsupported file type. Allowed: "
+                                   f"{', '.join('.' + e for e in ALLOWED_EXTENSIONS)}")
+    chunks, total = [], 0
+    while chunk := await file.read(UPLOAD_CHUNK):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=_too_large_message())
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="File is empty")
+    sample = content[:BINARY_SNIFF_BYTES]
+    if sample.count(b"\0") > len(sample) * MAX_NUL_RATIO:
+        raise HTTPException(status_code=400,
+                            detail="File looks binary; only text files are accepted")
+    return content, ext
+
 @app.post("/artifacts/upload")
 async def upload_artifact(file: UploadFile = File(...),
                           user=Depends(get_current_user)):
-    content = await file.read()
+    content, ext = await read_checked_upload(file)
+    display_name = clean_display_name(file.filename)
     filehash = hashlib.sha256(content).hexdigest()
-    safe_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}"
-    filepath  = os.path.join(UPLOAD_DIR, safe_name)
+    # never build the path from the client's filename
+    filepath = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}.{ext}")
 
     with open(filepath, "wb") as f:
         f.write(content)
@@ -477,7 +548,7 @@ async def upload_artifact(file: UploadFile = File(...),
     conn = get_db()
     cur = conn.execute(
         "INSERT INTO artifacts (filename, filepath, filehash, user_id) VALUES (?,?,?,?)",
-        (file.filename, filepath, filehash, user["id"])
+        (display_name, filepath, filehash, user["id"])
     )
     artifact_id = cur.lastrowid
     conn.commit()
@@ -498,7 +569,7 @@ async def upload_artifact(file: UploadFile = File(...),
     conn.commit()
 
     # LLM YARA generation
-    rule_text, generated_by = await generate_yara_rule(file.filename, indicators, text)
+    rule_text, generated_by = await generate_yara_rule(display_name, indicators, text)
     is_valid, validation_msg = validate_yara(rule_text)
     conn.execute(
         "INSERT INTO yara_rules (artifact_id, rule_text, is_valid, user_id, generated_by) "
@@ -510,7 +581,7 @@ async def upload_artifact(file: UploadFile = File(...),
 
     return {
         "artifact_id": artifact_id,
-        "filename":    file.filename,
+        "filename":    display_name,
         "filehash":    filehash,
         "indicators":  indicators,
         "yara_rule":   rule_text,

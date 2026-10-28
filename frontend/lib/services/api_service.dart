@@ -6,6 +6,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 class ApiService {
   static const String baseUrl = 'http://127.0.0.1:8000';
 
+  // Builds an exception from the server's "detail" message, so screens can
+  // show e.g. "Unsupported file type" instead of raw JSON.
+  static Exception _error(http.Response response, String fallback) {
+    try {
+      final detail = jsonDecode(response.body)['detail'];
+      if (detail is String && detail.isNotEmpty) return Exception(detail);
+      if (detail is List && detail.isNotEmpty) {
+        // FastAPI request validation errors
+        return Exception(detail.map((d) => d['msg'] ?? '$d').join('; '));
+      }
+    } catch (_) {}
+    return Exception('$fallback (HTTP ${response.statusCode})');
+  }
+
   static Future<String?> getToken() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString('token');
@@ -66,7 +80,7 @@ class ApiService {
     final streamed = await request.send();
     final response = await http.Response.fromStream(streamed);
     if (response.statusCode == 200) return jsonDecode(response.body);
-    throw Exception('Upload failed: ${response.body}');
+    throw _error(response, 'Upload failed');
   }
 
   static Future<List<dynamic>> getArtifacts() async {

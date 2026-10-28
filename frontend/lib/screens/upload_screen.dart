@@ -17,7 +17,8 @@ class _UploadScreenState extends State<UploadScreen> {
   Future<void> _pick() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['txt', 'log', 'json', 'csv', 'xml', 'md', 'yar', 'yara'],
+      // must match ALLOWED_EXTENSIONS on the backend
+      allowedExtensions: ['txt', 'log', 'json', 'csv', 'xml', 'md'],
       withData: true,
     );
     if (result == null || result.files.isEmpty) return;
@@ -122,7 +123,7 @@ class _UploadScreenState extends State<UploadScreen> {
                       ),
                       const SizedBox(height: 8),
                       const Text(
-                        'Supported: .txt .log .json .csv .xml .md .yar .yara',
+                        'Supported: .txt .log .json .csv .xml .md (text only, max 5 MB)',
                         style: TextStyle(color: Colors.white38, fontSize: 12),
                       ),
                     ],
