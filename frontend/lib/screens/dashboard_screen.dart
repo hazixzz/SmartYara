@@ -4,6 +4,7 @@ import '../services/api_service.dart';
 import '../screens/login_screen.dart';
 import '../screens/upload_screen.dart';
 import '../screens/rule_review_screen.dart';
+import '../screens/history_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -75,6 +76,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
         ]),
         actions: [
+          TextButton.icon(
+            onPressed: () async {
+              await Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const HistoryScreen()));
+              _load();
+            },
+            icon: const Icon(Icons.history, color: Color(0xFF00D4FF), size: 18),
+            label: const Text('History',
+                style: TextStyle(color: Color(0xFF00D4FF))),
+          ),
+          const SizedBox(width: 8),
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: Row(children: [
@@ -131,12 +143,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget _buildStatsRow() {
     final s = _stats ?? {};
     return GridView.count(
-      crossAxisCount: 4,
+      crossAxisCount: 3,
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
       crossAxisSpacing: 16,
       mainAxisSpacing: 16,
-      childAspectRatio: 1.6,
+      childAspectRatio: 2.4,
       children: [
         _statCard('Artifacts', '${s['total_artifacts'] ?? 0}',
             Icons.folder_open, const Color(0xFF00D4FF)),
@@ -146,6 +158,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             Icons.verified, const Color(0xFF00D4FF)),
         _statCard('Indicators', '${s['total_indicators'] ?? 0}',
             Icons.label, Colors.orangeAccent),
+        _statCard('Approved Rules', '${s['approved_rules'] ?? 0}',
+            Icons.verified_user, const Color(0xFF00FF88)),
+        _statCard('Draft Rules', '${s['draft_rules'] ?? 0}',
+            Icons.edit_note, Colors.amberAccent),
       ],
     );
   }
@@ -231,8 +247,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const SizedBox(height: 4),
-            Text('${a['indicator_count'] ?? 0} indicators extracted',
-                style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            Text(
+              '${a['indicator_count'] ?? 0} indicators extracted'
+              '${a['status'] == null ? '' : ' · ${a['status'] == 'approved' ? 'Approved' : 'Draft'}'}'
+              '${a['current_version'] == null ? '' : ' · v${a['current_version']}'}',
+              style: const TextStyle(color: Colors.white54, fontSize: 12)),
             Text(
               'SHA-256: ${(a['filehash'] ?? '').toString().substring(0, 16)}...',
               style: const TextStyle(
@@ -242,12 +261,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ],
         ),
         trailing: ElevatedButton.icon(
-          onPressed: () {
-            Navigator.push(context,
+          onPressed: () async {
+            await Navigator.push(context,
                 MaterialPageRoute(
                     builder: (_) =>
                         RuleReviewScreen(artifactId: a['id'],
                             filename: a['filename'])));
+            _load();   // status or version may have changed
           },
           icon: const Icon(Icons.code, size: 16),
           label: const Text('View Rule'),
